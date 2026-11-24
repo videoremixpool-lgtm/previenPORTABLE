@@ -1,0 +1,26 @@
+name: Build Portable Windows Reel Maker
+
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Build Portable EXE (.NET Framework 4.8)
+        run: dotnet build DaleMasBajoReelMaker.csproj -c Release -o dist
+
+      - name: Upload Portable EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: DaleMasBajoReelMaker-Portable
+          path: dist/DaleMasBajoReelMaker.exe
