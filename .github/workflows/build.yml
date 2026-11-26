@@ -16,6 +16,47 @@ jobs:
         with:
           dotnet-version: '8.0.x'
 
+      - name: Generate PREVIEW.ico
+        shell: powershell
+        run: |
+          Add-Type -AssemblyName System.Drawing
+          $s = 256
+          $bmp = New-Object System.Drawing.Bitmap $s, $s
+          $g = [System.Drawing.Graphics]::FromImage($bmp)
+          $g.SmoothingMode = 'AntiAlias'
+          $g.TextRenderingHint = 'AntiAliasGridFit'
+          $g.Clear([System.Drawing.Color]::Black)
+          $font = New-Object System.Drawing.Font('Arial', 36, [System.Drawing.FontStyle]::Bold)
+          $sf = New-Object System.Drawing.StringFormat
+          $sf.Alignment = [System.Drawing.StringAlignment]::Center
+          $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+          $rect = New-Object System.Drawing.RectangleF(0, 0, $s, $s)
+          $g.DrawString('PREVIEW', $font, [System.Drawing.Brushes]::White, $rect, $sf)
+          $g.Dispose()
+
+          $msPng = New-Object System.IO.MemoryStream
+          $bmp.Save($msPng, [System.Drawing.Imaging.ImageFormat]::Png)
+          $pngBytes = $msPng.ToArray()
+          $msPng.Dispose()
+          $bmp.Dispose()
+
+          $fs = [System.IO.File]::Create('PREVIEW.ico')
+          $bw = New-Object System.IO.BinaryWriter($fs)
+          $bw.Write([uint16]0)
+          $bw.Write([uint16]1)
+          $bw.Write([uint16]1)
+          $bw.Write([byte]0)
+          $bw.Write([byte]0)
+          $bw.Write([byte]0)
+          $bw.Write([byte]0)
+          $bw.Write([uint16]1)
+          $bw.Write([uint16]32)
+          $bw.Write([uint32]$pngBytes.Length)
+          $bw.Write([uint32]22)
+          $bw.Write($pngBytes)
+          $bw.Close()
+          $fs.Close()
+
       - name: Build Portable EXE (.NET Framework 4.8)
         run: dotnet build DaleMasBajoReelMaker.csproj -c Release -o dist
 
