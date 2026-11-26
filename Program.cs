@@ -1,5 +1,4 @@
 using System;
-using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -77,6 +76,7 @@ namespace DaleMasBajoReelMaker
             BackColor = BgMain;
             Font = new Font("Segoe UI", 9.5f);
             AllowDrop = true;
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch { }
 
             var header = new Panel { Dock = DockStyle.Top, Height = 56, BackColor = CardWhite };
             header.Paint += (s, e) => e.Graphics.DrawLine(new Pen(BorderGray), 0, header.Height - 1, header.Width, header.Height - 1);
@@ -396,7 +396,7 @@ namespace DaleMasBajoReelMaker
                                         {
                                             int pct = ClampInt((int)(readBytes * 100 / totalBytes), 0, 100);
                                             double totalMb = totalBytes / (1024.0 * 1024.0);
-                                            Invoke((Action)(() =>
+                                            BeginInvoke((Action)(() =>
                                             {
                                                 _progress.Style = ProgressBarStyle.Continuous;
                                                 _progress.Value = pct;
@@ -406,7 +406,7 @@ namespace DaleMasBajoReelMaker
                                         }
                                         else
                                         {
-                                            Invoke((Action)(() =>
+                                            BeginInvoke((Action)(() =>
                                             {
                                                 _lblStatus.ForeColor = AccentBlue;
                                                 _lblStatus.Text = $"Descargando motor de video... {mb:F1} MB";
@@ -429,7 +429,7 @@ namespace DaleMasBajoReelMaker
             if (!downloaded)
                 throw new Exception("No se pudo descargar FFmpeg: " + (lastErr?.Message ?? "Error de red"));
 
-            Invoke((Action)(() =>
+            BeginInvoke((Action)(() =>
             {
                 _progress.Value = 100;
                 _lblStatus.Text = "Extrayendo ffmpeg.exe...";
@@ -452,7 +452,7 @@ namespace DaleMasBajoReelMaker
             if (!File.Exists(FfmpegExePath))
                 throw new Exception("No se encontró ffmpeg.exe dentro del archivo descargado.");
 
-            Invoke((Action)(() =>
+            BeginInvoke((Action)(() =>
             {
                 _progress.Style = ProgressBarStyle.Continuous;
                 _progress.Value = 0;
@@ -532,11 +532,14 @@ namespace DaleMasBajoReelMaker
 
                 await Task.Run(() => RenderReel(ff, input, outPath, title, artist, bpm, startSec, endSec, pct =>
                 {
-                    Invoke((Action)(() =>
+                    if (!IsDisposed)
                     {
-                        _progress.Value = ClampInt(pct, 0, 100);
-                        _lblStatus.Text = $"Renderizando... {pct}%";
-                    }));
+                        BeginInvoke((Action)(() =>
+                        {
+                            _progress.Value = ClampInt(pct, 0, 100);
+                            _lblStatus.Text = pct >= 100 ? "Finalizando archivo..." : $"Renderizando... {pct}%";
+                        }));
+                    }
                 }, _cts.Token));
 
                 _lastOutputPath = outPath;
@@ -617,7 +620,6 @@ namespace DaleMasBajoReelMaker
                         continue;
                     }
 
-                    // Try splitting cleanly into 2 balanced lines
                     int bestSplit = -1;
                     float bestDiff = float.MaxValue;
                     for (int i = 1; i < words.Length; i++)
@@ -646,7 +648,6 @@ namespace DaleMasBajoReelMaker
                 }
             }
 
-            // Fallback if extremely long single token
             int mid = title.Length / 2;
             return (new[] { title.Substring(0, mid), title.Substring(mid).TrimStart() }, 22f);
         }
@@ -729,7 +730,6 @@ namespace DaleMasBajoReelMaker
                     using (var brushTrack = new SolidBrush(ColorTranslator.FromHtml("#E4E6EB")))
                     using (var brushShadow = new SolidBrush(Color.FromArgb(40, 0, 20, 70)))
                     {
-                        // Pre-compute layout for 1 or 2 lines before the BPM pill
                         string[] titleLines;
                         float titleFontSize;
                         float artistFontSize;
@@ -915,14 +915,23 @@ namespace DaleMasBajoReelMaker
                                 encProc.StandardInput.BaseStream.Write(outBuf, 0, outBuf.Length);
 
                                 if (idx % 10 == 0)
-                                    onProgress((int)Math.Round(100.0 * idx / totalFrames));
+                                    onProgress((int)Math.Round(99.0 * idx / totalFrames));
                             }
                         }
                     }
 
+                    encProc.StandardInput.BaseStream.Flush();
                     encProc.StandardInput.BaseStream.Close();
                     encProc.WaitForExit();
-                    decProc.WaitForExit();
+
+                    try
+                    {
+                        if (!decProc.HasExited && !decProc.WaitForExit(1500))
+                            decProc.Kill();
+                    }
+                    catch { }
+
+                    onProgress(100);
                 }
             }
             finally
