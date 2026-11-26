@@ -6,6 +6,7 @@
     <LangVersion>latest</LangVersion>
     <AssemblyName>DaleMasBajoReelMaker</AssemblyName>
     <RootNamespace>DaleMasBajoReelMaker</RootNamespace>
+    <ApplicationIcon>PREVIEW.ico</ApplicationIcon>
     <Optimize>true</Optimize>
     <DebugType>none</DebugType>
   </PropertyGroup>
