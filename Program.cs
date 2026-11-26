@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
@@ -23,6 +24,7 @@ namespace DaleMasBajoReelMaker
         private static void Main()
         {
             ServicePointManager.SecurityProtocol = SecurityProtocolType.Tls12;
+            ServicePointManager.DefaultConnectionLimit = 8;
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
             Application.Run(new MainForm());
@@ -244,7 +246,7 @@ namespace DaleMasBajoReelMaker
 
             _lblStatus = new Label
             {
-                Text = File.Exists(FfmpegExePath) ? "Listo para recibir un video." : "Listo. En el primer uso descargará FFmpeg automáticamente.",
+                Text = File.Exists(FfmpegExePath) ? "Listo para recibir un video." : "Listo. En el primer uso descargará FFmpeg (~52 MB).",
                 ForeColor = TextSecondary,
                 Location = new Point(20, 568),
                 Size = new Size(464, 24)
@@ -350,32 +352,94 @@ namespace DaleMasBajoReelMaker
 
             Directory.CreateDirectory(AppDataDir);
             string zipPath = Path.Combine(AppDataDir, "ffmpeg.zip");
-            const string url = "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip";
 
-            Invoke((Action)(() =>
+            string[] urls =
             {
-                _lblStatus.ForeColor = AccentBlue;
-                _lblStatus.Text = "Descargando motor de video (solo esta primera vez)...";
-                _progress.Style = ProgressBarStyle.Marquee;
-            }));
+                "https://github.com/ffbinaries/ffbinaries-prebuilt/releases/download/v6.1/ffmpeg-6.1-win-64.zip",
+                "https://www.gyan.dev/ffmpeg/builds/ffmpeg-release-essentials.zip"
+            };
 
-            using (var http = new HttpClient { Timeout = TimeSpan.FromMinutes(10) })
-            using (var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead))
+            Exception lastErr = null;
+            bool downloaded = false;
+
+            foreach (string url in urls)
             {
-                resp.EnsureSuccessStatusCode();
-                using (var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None))
+                try
                 {
-                    await resp.Content.CopyToAsync(fs);
+                    using (var handler = new HttpClientHandler { AllowAutoRedirect = true })
+                    using (var http = new HttpClient(handler) { Timeout = TimeSpan.FromMinutes(3) })
+                    {
+                        http.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0 (Windows NT 10.0; Win64; x64)");
+                        using (var resp = await http.GetAsync(url, HttpCompletionOption.ResponseHeadersRead))
+                        {
+                            resp.EnsureSuccessStatusCode();
+                            long totalBytes = resp.Content.Headers.ContentLength ?? -1;
+
+                            using (var stream = await resp.Content.ReadAsStreamAsync())
+                            using (var fs = new FileStream(zipPath, FileMode.Create, FileAccess.Write, FileShare.None, 65536, true))
+                            {
+                                byte[] buf = new byte[65536];
+                                long readBytes = 0;
+                                int n;
+                                DateTime lastUi = DateTime.MinValue;
+
+                                while ((n = await stream.ReadAsync(buf, 0, buf.Length)) > 0)
+                                {
+                                    await fs.WriteAsync(buf, 0, n);
+                                    readBytes += n;
+
+                                    if ((DateTime.UtcNow - lastUi).TotalMilliseconds > 120)
+                                    {
+                                        lastUi = DateTime.UtcNow;
+                                        double mb = readBytes / (1024.0 * 1024.0);
+                                        if (totalBytes > 0)
+                                        {
+                                            int pct = ClampInt((int)(readBytes * 100 / totalBytes), 0, 100);
+                                            double totalMb = totalBytes / (1024.0 * 1024.0);
+                                            Invoke((Action)(() =>
+                                            {
+                                                _progress.Style = ProgressBarStyle.Continuous;
+                                                _progress.Value = pct;
+                                                _lblStatus.ForeColor = AccentBlue;
+                                                _lblStatus.Text = $"Descargando motor de video... {pct}% ({mb:F1} / {totalMb:F1} MB)";
+                                            }));
+                                        }
+                                        else
+                                        {
+                                            Invoke((Action)(() =>
+                                            {
+                                                _lblStatus.ForeColor = AccentBlue;
+                                                _lblStatus.Text = $"Descargando motor de video... {mb:F1} MB";
+                                            }));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    downloaded = true;
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    lastErr = ex;
                 }
             }
 
-            Invoke((Action)(() => _lblStatus.Text = "Extrayendo ffmpeg.exe..."));
+            if (!downloaded)
+                throw new Exception("No se pudo descargar FFmpeg: " + (lastErr?.Message ?? "Error de red"));
+
+            Invoke((Action)(() =>
+            {
+                _progress.Value = 100;
+                _lblStatus.Text = "Extrayendo ffmpeg.exe...";
+            }));
 
             using (var archive = ZipFile.OpenRead(zipPath))
             {
                 foreach (var entry in archive.Entries)
                 {
-                    if (entry.FullName.EndsWith("/bin/ffmpeg.exe", StringComparison.OrdinalIgnoreCase))
+                    if (entry.Name.Equals("ffmpeg.exe", StringComparison.OrdinalIgnoreCase))
                     {
                         entry.ExtractToFile(FfmpegExePath, true);
                         break;
@@ -384,6 +448,9 @@ namespace DaleMasBajoReelMaker
             }
 
             if (File.Exists(zipPath)) File.Delete(zipPath);
+
+            if (!File.Exists(FfmpegExePath))
+                throw new Exception("No se encontró ffmpeg.exe dentro del archivo descargado.");
 
             Invoke((Action)(() =>
             {
@@ -527,6 +594,77 @@ namespace DaleMasBajoReelMaker
             return $"{s / 60}:{s % 60:D2}";
         }
 
+        private static (string[] lines, float fontSize) LayoutTitleTwoLines(Graphics g, string title, float maxWidth)
+        {
+            if (string.IsNullOrWhiteSpace(title))
+                return (new[] { "" }, 38f);
+
+            using (var f38 = new Font("Segoe UI", 38f, FontStyle.Bold))
+            {
+                if (g.MeasureString(title, f38).Width <= maxWidth)
+                    return (new[] { title }, 38f);
+            }
+
+            string[] words = title.Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+            for (float sz = 34f; sz >= 22f; sz -= 2f)
+            {
+                using (var f = new Font("Segoe UI", sz, FontStyle.Bold))
+                {
+                    if (words.Length == 1)
+                    {
+                        if (g.MeasureString(title, f).Width <= maxWidth)
+                            return (new[] { title }, sz);
+                        continue;
+                    }
+
+                    // Try splitting cleanly into 2 balanced lines
+                    int bestSplit = -1;
+                    float bestDiff = float.MaxValue;
+                    for (int i = 1; i < words.Length; i++)
+                    {
+                        string l1 = string.Join(" ", words, 0, i);
+                        string l2 = string.Join(" ", words, i, words.Length - i);
+                        float w1 = g.MeasureString(l1, f).Width;
+                        float w2 = g.MeasureString(l2, f).Width;
+                        if (w1 <= maxWidth && w2 <= maxWidth)
+                        {
+                            float diff = Math.Abs(w1 - w2);
+                            if (diff < bestDiff)
+                            {
+                                bestDiff = diff;
+                                bestSplit = i;
+                            }
+                        }
+                    }
+
+                    if (bestSplit > 0)
+                    {
+                        string l1 = string.Join(" ", words, 0, bestSplit);
+                        string l2 = string.Join(" ", words, bestSplit, words.Length - bestSplit);
+                        return (new[] { l1, l2 }, sz);
+                    }
+                }
+            }
+
+            // Fallback if extremely long single token
+            int mid = title.Length / 2;
+            return (new[] { title.Substring(0, mid), title.Substring(mid).TrimStart() }, 22f);
+        }
+
+        private static float FitArtistFontSize(Graphics g, string artist, float maxWidth)
+        {
+            if (string.IsNullOrWhiteSpace(artist)) return 26f;
+            for (float sz = 26f; sz >= 18f; sz -= 1f)
+            {
+                using (var f = new Font("Segoe UI", sz, FontStyle.Regular))
+                {
+                    if (g.MeasureString(artist, f).Width <= maxWidth)
+                        return sz;
+                }
+            }
+            return 18f;
+        }
+
         private static void RenderReel(
             string ffmpeg, string inputPath, string outputPath,
             string title, string artist, string bpm,
@@ -583,8 +721,6 @@ namespace DaleMasBajoReelMaker
                     using (var canvasBmp = new Bitmap(W, H, PixelFormat.Format32bppArgb))
                     using (var vidBmp = new Bitmap(VID_SIZE, VID_SIZE, PixelFormat.Format32bppArgb))
                     using (var fontAvail = new Font("Segoe UI", 22f, FontStyle.Regular))
-                    using (var fontTitle = new Font("Segoe UI", 38f, FontStyle.Bold))
-                    using (var fontArtist = new Font("Segoe UI", 26f, FontStyle.Regular))
                     using (var fontTime = new Font("Segoe UI", 17f, FontStyle.Regular))
                     using (var brushBlue = new SolidBrush(ColorTranslator.FromHtml("#0066FF")))
                     using (var brushWhite = new SolidBrush(Color.White))
@@ -593,152 +729,194 @@ namespace DaleMasBajoReelMaker
                     using (var brushTrack = new SolidBrush(ColorTranslator.FromHtml("#E4E6EB")))
                     using (var brushShadow = new SolidBrush(Color.FromArgb(40, 0, 20, 70)))
                     {
-                        const string availText = "A V A I L A B L E   N O W";
-
-                        for (int idx = 0; idx < totalFrames; idx++)
+                        // Pre-compute layout for 1 or 2 lines before the BPM pill
+                        string[] titleLines;
+                        float titleFontSize;
+                        float artistFontSize;
+                        using (var measureG = Graphics.FromImage(canvasBmp))
                         {
-                            ct.ThrowIfCancellationRequested();
+                            float maxTitleW = VID_SIZE - 148f - 24f;
+                            (titleLines, titleFontSize) = LayoutTitleTwoLines(measureG, title, maxTitleW);
+                            artistFontSize = FitArtistFontSize(measureG, artist, VID_SIZE);
+                        }
 
-                            int readTotal = 0;
-                            while (readTotal < vidByteCount)
+                        bool isTwoLines = titleLines.Length > 1;
+                        int totalTitleChars = titleLines.Length == 1
+                            ? titleLines[0].Length
+                            : titleLines[0].Length + titleLines[1].Length;
+
+                        using (var fontTitle = new Font("Segoe UI", titleFontSize, FontStyle.Bold))
+                        using (var fontArtist = new Font("Segoe UI", artistFontSize, FontStyle.Regular))
+                        {
+                            const string availText = "A V A I L A B L E   N O W";
+
+                            for (int idx = 0; idx < totalFrames; idx++)
                             {
-                                int n = decProc.StandardOutput.BaseStream.Read(vidBuf, readTotal, vidByteCount - readTotal);
-                                if (n <= 0) break;
-                                readTotal += n;
-                            }
+                                ct.ThrowIfCancellationRequested();
 
-                            if (readTotal == vidByteCount)
-                            {
-                                var vLock = vidBmp.LockBits(new Rectangle(0, 0, VID_SIZE, VID_SIZE), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
-                                Marshal.Copy(vidBuf, 0, vLock.Scan0, vidByteCount);
-                                vidBmp.UnlockBits(vLock);
-                            }
-
-                            double t = (double)idx / FPS;
-
-                            using (var g = Graphics.FromImage(canvasBmp))
-                            {
-                                g.SmoothingMode = SmoothingMode.AntiAlias;
-                                g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
-                                g.Clear(ColorTranslator.FromHtml("#0066FF"));
-
-                                if (t >= 0.08)
+                                int readTotal = 0;
+                                while (readTotal < vidByteCount)
                                 {
-                                    double p = Math.Min(1.0, (t - 0.08) / 0.37);
-                                    int nChars = (int)Math.Round(p * availText.Length);
-                                    string shown = availText.Substring(0, nChars) + (t < 0.50 && nChars < availText.Length ? "|" : "");
-                                    SizeF fullSz = g.MeasureString(availText, fontAvail);
-                                    g.DrawString(shown, fontAvail, brushWhite, (W - fullSz.Width) / 2f, 288f);
+                                    int n = decProc.StandardOutput.BaseStream.Read(vidBuf, readTotal, vidByteCount - readTotal);
+                                    if (n <= 0) break;
+                                    readTotal += n;
                                 }
 
-                                double pCard = EaseOutCubic(t / 0.42);
-                                int cardY = (int)Math.Round(H - (H - CARD_Y_FINAL) * pCard);
-
-                                using (var shPath = RoundedRect(new RectangleF(CARD_X + 4, cardY + 14, CARD_W - 8, CARD_H), CARD_R))
-                                    g.FillPath(brushShadow, shPath);
-
-                                using (var cardPath = RoundedRect(new RectangleF(CARD_X, cardY, CARD_W, CARD_H), CARD_R))
-                                    g.FillPath(brushWhite, cardPath);
-
-                                int vx = CARD_X + VID_PAD;
-                                int vy = cardY + VID_PAD;
-
-                                if (t >= 0.18)
+                                if (readTotal == vidByteCount)
                                 {
-                                    double pWipe = EaseOutCubic((t - 0.18) / 0.34);
-                                    int curW = Math.Max(4, (int)Math.Round(VID_SIZE * pWipe));
-                                    int x0 = (VID_SIZE - curW) / 2;
-                                    float rDyn = Math.Min(VID_R, curW / 2f);
-                                    using (var clipPath = RoundedRect(new RectangleF(vx + x0, vy, curW, VID_SIZE), rDyn))
+                                    var vLock = vidBmp.LockBits(new Rectangle(0, 0, VID_SIZE, VID_SIZE), ImageLockMode.WriteOnly, PixelFormat.Format32bppArgb);
+                                    Marshal.Copy(vidBuf, 0, vLock.Scan0, vidByteCount);
+                                    vidBmp.UnlockBits(vLock);
+                                }
+
+                                double t = (double)idx / FPS;
+
+                                using (var g = Graphics.FromImage(canvasBmp))
+                                {
+                                    g.SmoothingMode = SmoothingMode.AntiAlias;
+                                    g.TextRenderingHint = TextRenderingHint.AntiAliasGridFit;
+                                    g.Clear(ColorTranslator.FromHtml("#0066FF"));
+
+                                    if (t >= 0.08)
                                     {
-                                        var state = g.Save();
-                                        g.SetClip(clipPath);
-                                        g.DrawImage(vidBmp, vx, vy, VID_SIZE, VID_SIZE);
-                                        g.Restore(state);
+                                        double p = Math.Min(1.0, (t - 0.08) / 0.37);
+                                        int nChars = (int)Math.Round(p * availText.Length);
+                                        string shown = availText.Substring(0, nChars) + (t < 0.50 && nChars < availText.Length ? "|" : "");
+                                        SizeF fullSz = g.MeasureString(availText, fontAvail);
+                                        g.DrawString(shown, fontAvail, brushWhite, (W - fullSz.Width) / 2f, 288f);
                                     }
-                                }
 
-                                float titleX = CARD_X + VID_PAD;
-                                float titleY = cardY + 716;
-                                float artistY = cardY + 778;
+                                    double pCard = EaseOutCubic(t / 0.42);
+                                    int cardY = (int)Math.Round(H - (H - CARD_Y_FINAL) * pCard);
 
-                                if (t >= 0.38 && title.Length > 0)
-                                {
-                                    double pt = Math.Min(1.0, (t - 0.38) / 0.24);
-                                    int nt = (int)Math.Round(pt * title.Length);
-                                    string ts = title.Substring(0, nt) + (t < 0.62 ? "|" : "");
-                                    g.DrawString(ts, fontTitle, brushNavy, titleX, titleY);
-                                }
+                                    using (var shPath = RoundedRect(new RectangleF(CARD_X + 4, cardY + 14, CARD_W - 8, CARD_H), CARD_R))
+                                        g.FillPath(brushShadow, shPath);
 
-                                if (t >= 0.62 && artist.Length > 0)
-                                {
-                                    double pa = Math.Min(1.0, (t - 0.62) / 0.30);
-                                    int na = (int)Math.Round(pa * artist.Length);
-                                    string ars = artist.Substring(0, na) + (t < 0.98 ? "|" : "");
-                                    g.DrawString(ars, fontArtist, brushSlate, titleX, artistY);
-                                }
+                                    using (var cardPath = RoundedRect(new RectangleF(CARD_X, cardY, CARD_W, CARD_H), CARD_R))
+                                        g.FillPath(brushWhite, cardPath);
 
-                                if (t >= 0.65 && bpm.Length > 0)
-                                {
-                                    double sb = SpringPop((t - 0.65) / 0.30);
-                                    if (sb > 0.02)
+                                    int vx = CARD_X + VID_PAD;
+                                    int vy = cardY + VID_PAD;
+
+                                    if (t >= 0.18)
                                     {
-                                        float pw = 148f * (float)sb;
-                                        float ph = 52f * (float)sb;
-                                        float cx = CARD_X + CARD_W - VID_PAD - 74f;
-                                        float cy = cardY + 768f;
-                                        using (var pPath = RoundedRect(new RectangleF(cx - pw / 2f, cy - ph / 2f, pw, ph), ph / 2f))
-                                            g.FillPath(brushBlue, pPath);
-                                        if (sb > 0.45)
+                                        double pWipe = EaseOutCubic((t - 0.18) / 0.34);
+                                        int curW = Math.Max(4, (int)Math.Round(VID_SIZE * pWipe));
+                                        int x0 = (VID_SIZE - curW) / 2;
+                                        float rDyn = Math.Min(VID_R, curW / 2f);
+                                        using (var clipPath = RoundedRect(new RectangleF(vx + x0, vy, curW, VID_SIZE), rDyn))
                                         {
-                                            using (var scaledFont = new Font("Segoe UI", 19f * (float)sb, FontStyle.Bold))
+                                            var state = g.Save();
+                                            g.SetClip(clipPath);
+                                            g.DrawImage(vidBmp, vx, vy, VID_SIZE, VID_SIZE);
+                                            g.Restore(state);
+                                        }
+                                    }
+
+                                    float titleX = CARD_X + VID_PAD;
+                                    float line1Y = isTwoLines ? cardY + 696 : cardY + 716;
+                                    float line2Y = cardY + 744;
+                                    float artistY = isTwoLines ? cardY + 806 : cardY + 778;
+
+                                    if (t >= 0.38 && totalTitleChars > 0)
+                                    {
+                                        double pt = Math.Min(1.0, (t - 0.38) / 0.24);
+                                        int nt = (int)Math.Round(pt * totalTitleChars);
+                                        bool typing = t < 0.62;
+
+                                        if (!isTwoLines)
+                                        {
+                                            string ts = titleLines[0].Substring(0, Math.Min(nt, titleLines[0].Length)) + (typing ? "|" : "");
+                                            g.DrawString(ts, fontTitle, brushNavy, titleX, line1Y);
+                                        }
+                                        else
+                                        {
+                                            int l1Len = titleLines[0].Length;
+                                            if (nt <= l1Len)
                                             {
-                                                SizeF bsz = g.MeasureString(bpm, scaledFont);
-                                                g.DrawString(bpm, scaledFont, brushWhite, cx - bsz.Width / 2f, cy - bsz.Height / 2f);
+                                                string s1 = titleLines[0].Substring(0, nt) + (typing ? "|" : "");
+                                                g.DrawString(s1, fontTitle, brushNavy, titleX, line1Y);
                                             }
+                                            else
+                                            {
+                                                g.DrawString(titleLines[0], fontTitle, brushNavy, titleX, line1Y);
+                                                int rem = Math.Min(nt - l1Len, titleLines[1].Length);
+                                                string s2 = titleLines[1].Substring(0, rem) + (typing ? "|" : "");
+                                                g.DrawString(s2, fontTitle, brushNavy, titleX, line2Y);
+                                            }
+                                        }
+                                    }
+
+                                    if (t >= 0.62 && artist.Length > 0)
+                                    {
+                                        double pa = Math.Min(1.0, (t - 0.62) / 0.30);
+                                        int na = (int)Math.Round(pa * artist.Length);
+                                        string ars = artist.Substring(0, na) + (t < 0.98 ? "|" : "");
+                                        g.DrawString(ars, fontArtist, brushSlate, titleX, artistY);
+                                    }
+
+                                    if (t >= 0.65 && bpm.Length > 0)
+                                    {
+                                        double sb = SpringPop((t - 0.65) / 0.30);
+                                        if (sb > 0.02)
+                                        {
+                                            float pw = 148f * (float)sb;
+                                            float ph = 52f * (float)sb;
+                                            float cx = CARD_X + CARD_W - VID_PAD - 74f;
+                                            float cy = isTwoLines ? cardY + 748f : cardY + 768f;
+                                            using (var pPath = RoundedRect(new RectangleF(cx - pw / 2f, cy - ph / 2f, pw, ph), ph / 2f))
+                                                g.FillPath(brushBlue, pPath);
+                                            if (sb > 0.45)
+                                            {
+                                                using (var scaledFont = new Font("Segoe UI", 19f * (float)sb, FontStyle.Bold))
+                                                {
+                                                    SizeF bsz = g.MeasureString(bpm, scaledFont);
+                                                    g.DrawString(bpm, scaledFont, brushWhite, cx - bsz.Width / 2f, cy - bsz.Height / 2f);
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    float barX = CARD_X + VID_PAD;
+                                    float barY = isTwoLines ? cardY + 892 : cardY + 885;
+                                    float barW = VID_SIZE;
+                                    float barH = 6f;
+
+                                    if (t >= 0.52)
+                                    {
+                                        double pBar = EaseOutCubic((t - 0.52) / 0.28);
+                                        float curBarW = (float)(barW * pBar);
+                                        if (curBarW > 2f)
+                                        {
+                                            using (var trPath = RoundedRect(new RectangleF(barX, barY, curBarW, barH), 3f))
+                                                g.FillPath(brushTrack, trPath);
+                                        }
+
+                                        if (t >= 0.80)
+                                        {
+                                            double prog = Math.Min(1.0, t / duration);
+                                            float fillW = Math.Max(8f, (float)(barW * prog));
+                                            using (var flPath = RoundedRect(new RectangleF(barX, barY, fillW, barH), 3f))
+                                                g.FillPath(brushBlue, flPath);
+                                            g.FillEllipse(brushBlue, barX + fillW - 9f, barY + barH / 2f - 9f, 18f, 18f);
+
+                                            string tCur = FormatTime(t);
+                                            string tRem = "-" + FormatTime(duration - t);
+                                            g.DrawString(tCur, fontTime, brushSlate, barX, barY + 22f);
+                                            SizeF rsz = g.MeasureString(tRem, fontTime);
+                                            g.DrawString(tRem, fontTime, brushSlate, barX + barW - rsz.Width, barY + 22f);
                                         }
                                     }
                                 }
 
-                                float barX = CARD_X + VID_PAD;
-                                float barY = cardY + 885;
-                                float barW = VID_SIZE;
-                                float barH = 6f;
+                                var cLock = canvasBmp.LockBits(new Rectangle(0, 0, W, H), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
+                                Marshal.Copy(cLock.Scan0, outBuf, 0, outBuf.Length);
+                                canvasBmp.UnlockBits(cLock);
+                                encProc.StandardInput.BaseStream.Write(outBuf, 0, outBuf.Length);
 
-                                if (t >= 0.52)
-                                {
-                                    double pBar = EaseOutCubic((t - 0.52) / 0.28);
-                                    float curBarW = (float)(barW * pBar);
-                                    if (curBarW > 2f)
-                                    {
-                                        using (var trPath = RoundedRect(new RectangleF(barX, barY, curBarW, barH), 3f))
-                                            g.FillPath(brushTrack, trPath);
-                                    }
-
-                                    if (t >= 0.80)
-                                    {
-                                        double prog = Math.Min(1.0, t / duration);
-                                        float fillW = Math.Max(8f, (float)(barW * prog));
-                                        using (var flPath = RoundedRect(new RectangleF(barX, barY, fillW, barH), 3f))
-                                            g.FillPath(brushBlue, flPath);
-                                        g.FillEllipse(brushBlue, barX + fillW - 9f, barY + barH / 2f - 9f, 18f, 18f);
-
-                                        string tCur = FormatTime(t);
-                                        string tRem = "-" + FormatTime(duration - t);
-                                        g.DrawString(tCur, fontTime, brushSlate, barX, barY + 22f);
-                                        SizeF rsz = g.MeasureString(tRem, fontTime);
-                                        g.DrawString(tRem, fontTime, brushSlate, barX + barW - rsz.Width, barY + 22f);
-                                    }
-                                }
+                                if (idx % 10 == 0)
+                                    onProgress((int)Math.Round(100.0 * idx / totalFrames));
                             }
-
-                            var cLock = canvasBmp.LockBits(new Rectangle(0, 0, W, H), ImageLockMode.ReadOnly, PixelFormat.Format32bppArgb);
-                            Marshal.Copy(cLock.Scan0, outBuf, 0, outBuf.Length);
-                            canvasBmp.UnlockBits(cLock);
-                            encProc.StandardInput.BaseStream.Write(outBuf, 0, outBuf.Length);
-
-                            if (idx % 10 == 0)
-                                onProgress((int)Math.Round(100.0 * idx / totalFrames));
                         }
                     }
 
